@@ -1,0 +1,103 @@
+# Salva questo file come: .github/workflows/sync.yml
+# nel repo mirror che hai creato (es. "plezy-apk-mirror").
+#
+# Non serve nessun secret/token da configurare: usa il GITHUB_TOKEN
+# automatico di GitHub Actions, a cui basta il permesso "contents: write"
+# dichiarato qui sotto.
+
+name: Mirror Plezy Android Releases
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # controlla ogni ora
+  workflow_dispatch: {}    # permette anche di lanciarlo a mano da GitHub
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Leggi ultima release upstream
+        id: upstream
+        run: |
+          LATEST=$(curl -s https://api.github.com/repos/edde746/plezy/releases/latest)
+          TAG=$(echo "$LATEST" | jq -r '.tag_name')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Controlla se è già mirrorata
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.upstream.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scarica, verifica ed estrai gli APK
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.upstream.outputs.tag }}"
+          mkdir -p work && cd work
+
+          RELEASE_JSON=$(curl -s "https://api.github.com/repos/edde746/plezy/releases/tags/$TAG")
+
+          declare -A ARCHS=(
+            [arm64-v8a]="plezy-android-arm64-v8a"
+            [armeabi-v7a]="plezy-android-armeabi-v7a"
+            [x86_64]="plezy-android-x86_64"
+          )
+
+          for arch in "${!ARCHS[@]}"; do
+            base="${ARCHS[$arch]}"
+            asset_name="${base}.tar.gz"
+
+            URL=$(echo "$RELEASE_JSON" | jq -r --arg name "$asset_name" '.assets[] | select(.name==$name) | .browser_download_url')
+            if [ -z "$URL" ] || [ "$URL" == "null" ]; then
+              echo "Asset $asset_name non trovato nella release $TAG, salto."
+              continue
+            fi
+
+            DIGEST=$(echo "$RELEASE_JSON" | jq -r --arg name "$asset_name" '.assets[] | select(.name==$name) | .digest // ""')
+            EXPECTED_SHA=${DIGEST#sha256:}
+
+            echo "Scarico $asset_name..."
+            curl -sL -o "$asset_name" "$URL"
+
+            if [ -n "$EXPECTED_SHA" ]; then
+              ACTUAL_SHA=$(sha256sum "$asset_name" | cut -d' ' -f1)
+              if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+                echo "ERRORE: checksum non corrispondente per $asset_name"
+                echo "Atteso:  $EXPECTED_SHA"
+                echo "Ottenuto: $ACTUAL_SHA"
+                exit 1
+              fi
+              echo "Checksum verificato per $asset_name."
+            else
+              echo "Nessun digest fornito da GitHub per $asset_name, salto la verifica."
+            fi
+
+            tar -xzf "$asset_name"
+            inner_tar="${base}.tar"
+            tar -xf "$inner_tar"
+
+            mv plezy.apk "plezy-${arch}.apk"
+            rm -f "$asset_name" "$inner_tar"
+          done
+
+          ls -la
+
+      - name: Pubblica release nel repo mirror
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          gh release create "$TAG" work/plezy-*.apk \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes "Mirror automatico degli APK Android estratti dalla release upstream: https://github.com/edde746/plezy/releases/tag/$TAG"
