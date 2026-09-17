@@ -81,12 +81,34 @@ jobs:
               echo "Nessun digest fornito da GitHub per $asset_name, salto la verifica."
             fi
 
-            tar -xzf "$asset_name"
-            inner_tar="${base}.tar"
-            tar -xf "$inner_tar"
+            mkdir -p "extract_${arch}"
+            tar -xzf "$asset_name" -C "extract_${arch}"
+            rm -f "$asset_name"
 
-            mv plezy.apk "plezy-${arch}.apk"
-            rm -f "$asset_name" "$inner_tar"
+            # Cerca l'apk direttamente (nel caso il tar.gz lo contenga già)
+            apk_path=$(find "extract_${arch}" -iname "*.apk" | head -n1)
+
+            # Altrimenti cerca un .tar annidato, qualunque sia il suo nome, ed estrailo
+            if [ -z "$apk_path" ]; then
+              inner_tar=$(find "extract_${arch}" -iname "*.tar" | head -n1)
+              if [ -z "$inner_tar" ]; then
+                echo "ERRORE: nessun .apk né .tar trovato per $arch"
+                find "extract_${arch}"
+                exit 1
+              fi
+              tar -xf "$inner_tar" -C "extract_${arch}"
+              rm -f "$inner_tar"
+              apk_path=$(find "extract_${arch}" -iname "*.apk" | head -n1)
+            fi
+
+            if [ -z "$apk_path" ]; then
+              echo "ERRORE: nessun .apk trovato per $arch dopo l'estrazione"
+              find "extract_${arch}"
+              exit 1
+            fi
+
+            mv "$apk_path" "plezy-${arch}.apk"
+            rm -rf "extract_${arch}"
           done
 
           ls -la
